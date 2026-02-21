@@ -6,12 +6,21 @@
 - Run on one server only (no GRE dependency).
 - Forward TCP/UDP ports to destination IP:port (per rule).
 - Manage rules with one command: add, list, show, update, remove, enable/disable.
+- Interactive menu (`sudo pfwd`) for easy management.
 - Persistent state in `/etc/pfwd/rules.tsv`.
 - Automatic restore at boot with `systemd` service `pfwd-restore.service`.
+- Performance profile with optimized defaults:
+  - interface-scoped matching (`PFWD_MATCH_PUB_IFACE=1`)
+  - automatic SNAT fast-path when safe (`PFWD_SNAT_MODE=auto`)
 - Idempotent firewall apply with dedicated chains:
   - `PFWD_PREROUTING`
   - `PFWD_POSTROUTING`
   - `PFWD_FORWARD`
+
+## Performance Notes
+- `pfwd` is not a long-running daemon; it only runs when you execute a command.
+- Forwarding is done by kernel `iptables` rules (very low userspace CPU/RAM overhead).
+- Default performance profile is stored at `/etc/pfwd/pfwd.conf`.
 
 ## Install
 ```bash
@@ -48,6 +57,7 @@ sudo pfwd
    - `3) Show Forward Details` for exact firewall mapping
    - `6/7` to enable/disable a rule
    - `5` to remove a rule
+   - `14) Performance Profile` to switch optimized/compatibility mode
 
 ## Command Reference
 ```bash
@@ -57,6 +67,8 @@ pfwd   # opens interactive menu (TTY)
 
 Commands:
 - `init`
+- `perf show`
+- `perf set [--match-pub-iface 0|1] [--snat-mode auto|snat|masquerade] [--snat-ip IP]`
 - `add --proto tcp|udp --listen IP:PORT --to IP:PORT [--name NAME] [--enable|--disable]`
 - `list`
 - `show <id>`
@@ -96,4 +108,14 @@ sudo pfwd import /root/pfwd-backup.tsv
 Dry-run:
 ```bash
 sudo pfwd --dry-run apply
+```
+
+Show performance profile:
+```bash
+sudo pfwd perf show
+```
+
+Set optimized profile:
+```bash
+sudo pfwd perf set --match-pub-iface 1 --snat-mode auto --snat-ip ""
 ```

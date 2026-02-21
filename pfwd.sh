@@ -6,6 +6,7 @@ VERSION="1.0.0"
 PFWD_DIR="${PFWD_DIR:-/etc/pfwd}"
 RULES_FILE="$PFWD_DIR/rules.tsv"
 COUNTER_FILE="$PFWD_DIR/.id_counter"
+PERF_CONFIG_FILE="$PFWD_DIR/pfwd.conf"
 SYSCTL_FILE="/etc/sysctl.d/99-pfwd.conf"
 SERVICE_NAME="pfwd-restore.service"
 
@@ -17,6 +18,9 @@ HEADER=$'id\tenabled\tproto\tlisten_ip\tlisten_port\tdest_ip\tdest_port\tname\tc
 
 DRY_RUN=0
 OUTPUT_JSON=0
+PFWD_MATCH_PUB_IFACE="1"
+PFWD_SNAT_MODE="auto"
+PFWD_SNAT_IP=""
 
 usage() {
     cat <<'EOF'
@@ -28,6 +32,8 @@ Usage:
 
 Commands:
   init
+  perf show
+  perf set [--match-pub-iface 0|1] [--snat-mode auto|snat|masquerade] [--snat-ip IP]
   add --proto tcp|udp --listen IP:PORT --to IP:PORT [--name NAME] [--enable|--disable]
   list
   show <id>
@@ -142,6 +148,86 @@ parse_endpoint() {
     printf '%s\t%s\n' "$ip" "$((10#$port))"
 }
 
+detect_pub_iface() {
+    local dev=""
+    dev="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+    if [ -n "$dev" ] && ip link show "$dev" >/dev/null 2>&1; then
+        printf '%s' "$dev"
+        return 0
+    fi
+    dev="$(ip route show default 2>/dev/null | awk 'NR==1{print $5}' || true)"
+    if [ -n "$dev" ] && ip link show "$dev" >/dev/null 2>&1; then
+        printf '%s' "$dev"
+        return 0
+    fi
+    return 1
+}
+
+detect_src_ip_for_dst() {
+    local dst="${1:-}"
+    local src=""
+    [ -n "$dst" ] || return 1
+    src="$(ip -4 route get "$dst" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    validate_ipv4 "$src" || return 1
+    printf '%s' "$src"
+}
+
+ensure_perf_config_file() {
+    mkdir -p "$PFWD_DIR"
+    if [ -f "$PERF_CONFIG_FILE" ]; then
+        return 0
+    fi
+    cat > "$PERF_CONFIG_FILE" <<'EOF'
+# PFWD performance profile
+# 1 = match only public interface for forwarded traffic (faster/stricter)
+PFWD_MATCH_PUB_IFACE="1"
+# auto = prefer SNAT with detected source IP, fallback to MASQUERADE
+# snat = force SNAT when a source IP is available (or from PFWD_SNAT_IP), fallback to MASQUERADE
+# masquerade = always use MASQUERADE
+PFWD_SNAT_MODE="auto"
+# Optional fixed SNAT source IP for performance/stability (empty = auto detect)
+PFWD_SNAT_IP=""
+EOF
+}
+
+load_perf_profile() {
+    PFWD_MATCH_PUB_IFACE="1"
+    PFWD_SNAT_MODE="auto"
+    PFWD_SNAT_IP=""
+    ensure_perf_config_file
+    # shellcheck disable=SC1090
+    source "$PERF_CONFIG_FILE" 2>/dev/null || true
+
+    case "${PFWD_MATCH_PUB_IFACE:-}" in
+        0|1) ;;
+        *) PFWD_MATCH_PUB_IFACE="1" ;;
+    esac
+
+    case "${PFWD_SNAT_MODE:-}" in
+        auto|snat|masquerade) ;;
+        *) PFWD_SNAT_MODE="auto" ;;
+    esac
+
+    if [ -n "${PFWD_SNAT_IP:-}" ] && ! validate_ipv4 "$PFWD_SNAT_IP"; then
+        PFWD_SNAT_IP=""
+    fi
+}
+
+resolve_snat_ip_for_dst() {
+    local dst="${1:-}"
+    local snat_ip=""
+    if [ -n "${PFWD_SNAT_IP:-}" ]; then
+        validate_ipv4 "$PFWD_SNAT_IP" && printf '%s' "$PFWD_SNAT_IP"
+        return 0
+    fi
+    snat_ip="$(detect_src_ip_for_dst "$dst" || true)"
+    if validate_ipv4 "$snat_ip" && [[ "$snat_ip" != 127.* ]]; then
+        printf '%s' "$snat_ip"
+        return 0
+    fi
+    return 1
+}
+
 ensure_state_files() {
     mkdir -p "$PFWD_DIR"
     if [ ! -f "$RULES_FILE" ]; then
@@ -155,6 +241,7 @@ ensure_state_files() {
     if [ "$first" != "$HEADER" ]; then
         die "Invalid state header in $RULES_FILE"
     fi
+    ensure_perf_config_file
 }
 
 next_rule_id() {
@@ -323,36 +410,60 @@ apply_rule() {
     local listen_port="$5"
     local dest_ip="$6"
     local dest_port="$7"
+    local pub_if="${8:-}"
 
     [ "$enabled" = "1" ] || return 0
 
     local comment_base="pfwd:${id}"
     local dmatch=()
+    local in_if=()
+    local out_if=()
     if [ "$listen_ip" != "0.0.0.0" ]; then
         dmatch=(-d "$listen_ip")
     fi
+    if [ "${PFWD_MATCH_PUB_IFACE:-1}" = "1" ] && [ -n "$pub_if" ] && [ "$listen_ip" = "0.0.0.0" ]; then
+        in_if=(-i "$pub_if")
+        out_if=(-o "$pub_if")
+    fi
 
     ipt_append_unique nat "$CHAIN_NAT_PRE" \
-        "${dmatch[@]}" -p "$proto" --dport "$listen_port" \
+        "${in_if[@]}" "${dmatch[@]}" -p "$proto" --dport "$listen_port" \
         -m comment --comment "${comment_base}:dnat:${listen_ip}:${listen_port}->${dest_ip}:${dest_port}" \
         -j DNAT --to-destination "${dest_ip}:${dest_port}"
 
     ipt_append_unique filter "$CHAIN_FILTER_FWD" \
-        -p "$proto" -d "$dest_ip" --dport "$dest_port" \
+        "${in_if[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
         -m conntrack --ctstate NEW,ESTABLISHED,RELATED \
         -m comment --comment "${comment_base}:fwd:${listen_port}->${dest_port}" \
         -j ACCEPT
 
     ipt_append_unique filter "$CHAIN_FILTER_FWD" \
-        -p "$proto" -s "$dest_ip" --sport "$dest_port" \
+        "${out_if[@]}" -p "$proto" -s "$dest_ip" --sport "$dest_port" \
         -m conntrack --ctstate ESTABLISHED,RELATED \
         -m comment --comment "${comment_base}:rev:${listen_port}->${dest_port}" \
         -j ACCEPT
 
-    ipt_append_unique nat "$CHAIN_NAT_POST" \
-        -p "$proto" -d "$dest_ip" --dport "$dest_port" \
-        -m comment --comment "${comment_base}:snat:${listen_port}->${dest_port}" \
-        -j MASQUERADE
+    local snat_ip=""
+    case "${PFWD_SNAT_MODE:-auto}" in
+        auto|snat)
+            snat_ip="$(resolve_snat_ip_for_dst "$dest_ip" || true)"
+            ;;
+        masquerade)
+            snat_ip=""
+            ;;
+    esac
+
+    if [ -n "$snat_ip" ]; then
+        ipt_append_unique nat "$CHAIN_NAT_POST" \
+            "${out_if[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
+            -m comment --comment "${comment_base}:snat-fixed:${listen_port}->${dest_port}:${snat_ip}" \
+            -j SNAT --to-source "$snat_ip"
+    else
+        ipt_append_unique nat "$CHAIN_NAT_POST" \
+            "${out_if[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
+            -m comment --comment "${comment_base}:snat-masq:${listen_port}->${dest_port}" \
+            -j MASQUERADE
+    fi
 }
 
 chain_exists() {
@@ -435,6 +546,88 @@ cmd_init() {
     cmd_apply
 }
 
+cmd_perf() {
+    ensure_state_files
+    load_perf_profile
+
+    local sub="${1:-show}"
+    shift || true
+
+    case "$sub" in
+        show)
+            if [ "$OUTPUT_JSON" -eq 1 ]; then
+                printf '{"match_pub_iface":%s,"snat_mode":"%s","snat_ip":"%s"}\n' \
+                    "$([ "$PFWD_MATCH_PUB_IFACE" = "1" ] && printf true || printf false)" \
+                    "$(json_escape "$PFWD_SNAT_MODE")" \
+                    "$(json_escape "$PFWD_SNAT_IP")"
+                return 0
+            fi
+            log "Performance profile:"
+            log "  match_pub_iface: $PFWD_MATCH_PUB_IFACE"
+            log "  snat_mode:       $PFWD_SNAT_MODE"
+            log "  snat_ip:         ${PFWD_SNAT_IP:-auto}"
+            ;;
+        set)
+            require_root_if_needed
+            local new_match="$PFWD_MATCH_PUB_IFACE"
+            local new_mode="$PFWD_SNAT_MODE"
+            local new_ip="$PFWD_SNAT_IP"
+
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --match-pub-iface)
+                        new_match="${2:-}"
+                        shift 2
+                        ;;
+                    --snat-mode)
+                        new_mode="${2:-}"
+                        shift 2
+                        ;;
+                    --snat-ip)
+                        new_ip="${2:-}"
+                        shift 2
+                        ;;
+                    *)
+                        die "Unknown option for perf set: $1"
+                        ;;
+                esac
+            done
+
+            case "$new_match" in
+                0|1) ;;
+                *) die "Invalid --match-pub-iface (use 0 or 1)." ;;
+            esac
+            case "$new_mode" in
+                auto|snat|masquerade) ;;
+                *) die "Invalid --snat-mode (use auto|snat|masquerade)." ;;
+            esac
+            if [ -n "$new_ip" ] && ! validate_ipv4 "$new_ip"; then
+                die "Invalid --snat-ip"
+            fi
+
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log "dry-run: would update $PERF_CONFIG_FILE"
+                log "  PFWD_MATCH_PUB_IFACE=\"$new_match\""
+                log "  PFWD_SNAT_MODE=\"$new_mode\""
+                log "  PFWD_SNAT_IP=\"$new_ip\""
+                return 0
+            fi
+
+            cat > "$PERF_CONFIG_FILE" <<EOF
+# PFWD performance profile
+PFWD_MATCH_PUB_IFACE="$new_match"
+PFWD_SNAT_MODE="$new_mode"
+PFWD_SNAT_IP="$new_ip"
+EOF
+            log "Performance profile updated."
+            cmd_apply
+            ;;
+        *)
+            die "Usage: pfwd perf show | pfwd perf set [--match-pub-iface 0|1] [--snat-mode auto|snat|masquerade] [--snat-ip IP]"
+            ;;
+    esac
+}
+
 cmd_add() {
     ensure_state_files
     require_root_if_needed
@@ -481,9 +674,14 @@ cmd_add() {
     if [ "$DRY_RUN" -eq 1 ]; then
         log "dry-run: would add rule id=$id"
         log "  proto=$proto listen=$lip:$lport to=$dip:$dport enabled=$enabled name=$name"
+        load_perf_profile
         ensure_chains
         purge_rules_by_id "$id"
-        apply_rule "$id" "$enabled" "$proto" "$lip" "$lport" "$dip" "$dport"
+        local dry_pub_if=""
+        if [ "${PFWD_MATCH_PUB_IFACE:-1}" = "1" ]; then
+            dry_pub_if="$(detect_pub_iface || true)"
+        fi
+        apply_rule "$id" "$enabled" "$proto" "$lip" "$lport" "$dip" "$dport" "$dry_pub_if"
         return 0
     fi
 
@@ -650,9 +848,14 @@ cmd_update() {
         log "dry-run: would update rule id=$id"
         log "  old: proto=$proto listen=$lip:$lport to=$dip:$dport enabled=$enabled name=$name"
         log "  new: proto=$new_proto listen=$new_lip:$new_lport to=$new_dip:$new_dport enabled=$new_enabled name=$new_name"
+        load_perf_profile
         ensure_chains
         purge_rules_by_id "$id"
-        apply_rule "$id" "$new_enabled" "$new_proto" "$new_lip" "$new_lport" "$new_dip" "$new_dport"
+        local dry_pub_if=""
+        if [ "${PFWD_MATCH_PUB_IFACE:-1}" = "1" ]; then
+            dry_pub_if="$(detect_pub_iface || true)"
+        fi
+        apply_rule "$id" "$new_enabled" "$new_proto" "$new_lip" "$new_lport" "$new_dip" "$new_dport" "$dry_pub_if"
         return 0
     fi
 
@@ -701,9 +904,14 @@ cmd_set_enabled() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "dry-run: would set rule id=$id enabled=$value"
+        load_perf_profile
         ensure_chains
         purge_rules_by_id "$id"
-        apply_rule "$id" "$value" "$proto" "$lip" "$lport" "$dip" "$dport"
+        local dry_pub_if=""
+        if [ "${PFWD_MATCH_PUB_IFACE:-1}" = "1" ]; then
+            dry_pub_if="$(detect_pub_iface || true)"
+        fi
+        apply_rule "$id" "$value" "$proto" "$lip" "$lport" "$dip" "$dport" "$dry_pub_if"
         return 0
     fi
 
@@ -716,13 +924,18 @@ cmd_apply() {
     ensure_state_files
     require_root_if_needed
     need_iptables
+    load_perf_profile
     ensure_chains
     purge_all_managed_rules
 
     local applied=0
+    local pub_if=""
+    if [ "${PFWD_MATCH_PUB_IFACE:-1}" = "1" ]; then
+        pub_if="$(detect_pub_iface || true)"
+    fi
     while IFS=$'\t' read -r rid renabled rproto rlip rlport rdip rdport _name _created _updated; do
         [ -n "${rid:-}" ] || continue
-        apply_rule "$rid" "$renabled" "$rproto" "$rlip" "$rlport" "$rdip" "$rdport"
+        apply_rule "$rid" "$renabled" "$rproto" "$rlip" "$rlport" "$rdip" "$rdport" "$pub_if"
         if [ "$renabled" = "1" ]; then
             applied=$((applied + 1))
         fi
@@ -733,6 +946,7 @@ cmd_apply() {
 
 cmd_status() {
     ensure_state_files
+    load_perf_profile
 
     local ipfwd="unknown"
     [ -r /proc/sys/net/ipv4/ip_forward ] && ipfwd="$(cat /proc/sys/net/ipv4/ip_forward)"
@@ -778,7 +992,10 @@ cmd_status() {
         printf '"state_rule_count":%s,' "$total_rules"
         printf '"state_enabled_count":%s,' "$enabled_rules"
         printf '"service_enabled":"%s",' "$(json_escape "$svc_enabled")"
-        printf '"service_active":"%s"' "$(json_escape "$svc_active")"
+        printf '"service_active":"%s",' "$(json_escape "$svc_active")"
+        printf '"perf_match_pub_iface":%s,' "$([ "$PFWD_MATCH_PUB_IFACE" = "1" ] && printf true || printf false)"
+        printf '"perf_snat_mode":"%s",' "$(json_escape "$PFWD_SNAT_MODE")"
+        printf '"perf_snat_ip":"%s"' "$(json_escape "$PFWD_SNAT_IP")"
         printf '}\n'
         return 0
     fi
@@ -791,6 +1008,9 @@ cmd_status() {
     log "managed fw rules:    $managed_count"
     log "state rules:         $total_rules (enabled: $enabled_rules)"
     log "restore service:     enabled=$svc_enabled active=$svc_active"
+    log "perf match iface:    $PFWD_MATCH_PUB_IFACE"
+    log "perf SNAT mode:      $PFWD_SNAT_MODE"
+    log "perf SNAT ip:        ${PFWD_SNAT_IP:-auto}"
     log ""
     log "Doctor:"
     [ "$ipfwd" = "1" ] || log "  - net.ipv4.ip_forward is not 1"
@@ -1113,6 +1333,39 @@ menu_flush_rules() {
     esac
 }
 
+menu_perf_profile() {
+    load_perf_profile
+    run_menu_cmd cmd_perf show || true
+    echo ""
+    echo "1) Optimized (recommended): match public iface + SNAT auto"
+    echo "2) Compatibility: no iface match + MASQUERADE"
+    echo "3) Custom"
+    echo "0) Back"
+    local ch
+    ch="$(prompt_menu_choice "Choose profile" "1")"
+    case "$ch" in
+        1)
+            run_menu_cmd cmd_perf set --match-pub-iface 1 --snat-mode auto --snat-ip ""
+            ;;
+        2)
+            run_menu_cmd cmd_perf set --match-pub-iface 0 --snat-mode masquerade --snat-ip ""
+            ;;
+        3)
+            local m s ip
+            m="$(prompt_menu_choice "match-pub-iface (0/1)" "$PFWD_MATCH_PUB_IFACE")"
+            s="$(prompt_menu_choice "snat-mode (auto/snat/masquerade)" "$PFWD_SNAT_MODE")"
+            ip="$(prompt_menu_choice "snat-ip (type 'auto' to clear)" "${PFWD_SNAT_IP:-auto}")"
+            [ "$ip" = "auto" ] && ip=""
+            run_menu_cmd cmd_perf set --match-pub-iface "$m" --snat-mode "$s" --snat-ip "$ip"
+            ;;
+        0)
+            ;;
+        *)
+            err "Invalid profile option."
+            ;;
+    esac
+}
+
 interactive_menu() {
     [ -t 0 ] || die "Interactive menu requires a TTY."
     require_root
@@ -1133,6 +1386,7 @@ interactive_menu() {
         echo "11) Export Rules"
         echo "12) Import Rules"
         echo "13) Flush Managed Rules"
+        echo "14) Performance Profile"
         echo "0) Exit"
         echo ""
 
@@ -1158,6 +1412,7 @@ interactive_menu() {
             11) menu_export_rules ;;
             12) menu_import_rules ;;
             13) menu_flush_rules ;;
+            14) menu_perf_profile ;;
             0|q|Q|exit|EXIT) break ;;
             *) err "Invalid menu choice." ;;
         esac
@@ -1211,6 +1466,7 @@ main() {
 
     case "$cmd" in
         init) cmd_init "$@" ;;
+        perf) cmd_perf "$@" ;;
         add) cmd_add "$@" ;;
         list) cmd_list "$@" ;;
         show) cmd_show "$@" ;;
