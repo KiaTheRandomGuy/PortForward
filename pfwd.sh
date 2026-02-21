@@ -34,10 +34,10 @@ Commands:
   init
   perf show
   perf set [--match-pub-iface 0|1] [--snat-mode auto|snat|masquerade] [--snat-ip IP]
-  add --proto tcp|udp --listen IP:PORT --to IP:PORT [--name NAME] [--enable|--disable]
+  add [--proto tcp|udp|both] --listen IP:PORT --to IP:PORT [--name NAME] [--enable|--disable]
   list
   show <id>
-  update <id> [--proto tcp|udp] [--listen IP:PORT] [--to IP:PORT] [--name NAME] [--enable|--disable]
+  update <id> [--proto tcp|udp|both] [--listen IP:PORT] [--to IP:PORT] [--name NAME] [--enable|--disable]
   remove <id>
   enable <id>
   disable <id>
@@ -132,7 +132,7 @@ validate_port() {
 
 validate_proto() {
     case "${1:-}" in
-        tcp|udp) return 0 ;;
+        tcp|udp|both) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -146,6 +146,41 @@ parse_endpoint() {
     validate_ipv4 "$ip" || return 1
     validate_port "$port" || return 1
     printf '%s\t%s\n' "$ip" "$((10#$port))"
+}
+
+parse_port_mappings() {
+    local spec="${1:-}"
+    local part left right
+    local -a out=()
+    declare -A seen=()
+
+    spec="${spec// /}"
+    [ -n "$spec" ] || return 1
+
+    IFS=',' read -r -a parts <<< "$spec"
+    for part in "${parts[@]}"; do
+        [ -n "$part" ] || continue
+        if [[ "$part" == *:* ]]; then
+            left="${part%%:*}"
+            right="${part##*:}"
+            validate_port "$left" || return 1
+            validate_port "$right" || return 1
+            left=$((10#$left))
+            right=$((10#$right))
+        else
+            validate_port "$part" || return 1
+            left=$((10#$part))
+            right="$left"
+        fi
+        if [ -n "${seen[$left]:-}" ]; then
+            return 1
+        fi
+        seen[$left]=1
+        out+=("${left}:${right}")
+    done
+
+    [ "${#out[@]}" -gt 0 ] || return 1
+    printf '%s\n' "${out[@]}"
 }
 
 detect_pub_iface() {
@@ -277,7 +312,9 @@ is_duplicate_listener() {
     local port="$3"
     local skip_id="${4:-}"
     awk -F'\t' -v proto="$proto" -v ip="$ip" -v port="$port" -v skip="$skip_id" '
-        NR>1 && $1!=skip && $3==proto && $4==ip && $5==port {found=1}
+        NR>1 && $1!=skip && $4==ip && $5==port {
+            if ($3=="both" || proto=="both" || $3==proto) found=1
+        }
         END {exit found ? 0 : 1}
     ' "$RULES_FILE"
 }
@@ -402,17 +439,14 @@ purge_all_managed_rules() {
     delete_matching_rules_table filter "pfwd:"
 }
 
-apply_rule() {
+apply_rule_proto() {
     local id="$1"
-    local enabled="$2"
-    local proto="$3"
-    local listen_ip="$4"
-    local listen_port="$5"
-    local dest_ip="$6"
-    local dest_port="$7"
-    local pub_if="${8:-}"
-
-    [ "$enabled" = "1" ] || return 0
+    local proto="$2"
+    local listen_ip="$3"
+    local listen_port="$4"
+    local dest_ip="$5"
+    local dest_port="$6"
+    local pub_if="${7:-}"
 
     local comment_base="pfwd:${id}"
     local dmatch=()
@@ -463,6 +497,26 @@ apply_rule() {
             "${out_if[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
             -m comment --comment "${comment_base}:snat-masq:${listen_port}->${dest_port}" \
             -j MASQUERADE
+    fi
+}
+
+apply_rule() {
+    local id="$1"
+    local enabled="$2"
+    local proto="$3"
+    local listen_ip="$4"
+    local listen_port="$5"
+    local dest_ip="$6"
+    local dest_port="$7"
+    local pub_if="${8:-}"
+
+    [ "$enabled" = "1" ] || return 0
+
+    if [ "$proto" = "both" ]; then
+        apply_rule_proto "$id" tcp "$listen_ip" "$listen_port" "$dest_ip" "$dest_port" "$pub_if"
+        apply_rule_proto "$id" udp "$listen_ip" "$listen_port" "$dest_ip" "$dest_port" "$pub_if"
+    else
+        apply_rule_proto "$id" "$proto" "$listen_ip" "$listen_port" "$dest_ip" "$dest_port" "$pub_if"
     fi
 }
 
@@ -632,7 +686,7 @@ cmd_add() {
     ensure_state_files
     require_root_if_needed
 
-    local proto=""
+    local proto="both"
     local listen=""
     local dest=""
     local name=""
@@ -650,7 +704,7 @@ cmd_add() {
         esac
     done
 
-    validate_proto "$proto" || die "Invalid --proto (use tcp or udp)."
+    validate_proto "$proto" || die "Invalid --proto (use tcp, udp, or both)."
     [ -n "$listen" ] || die "Missing --listen IP:PORT"
     [ -n "$dest" ] || die "Missing --to IP:PORT"
 
@@ -833,7 +887,7 @@ cmd_update() {
         esac
     done
 
-    validate_proto "$new_proto" || die "Invalid --proto (use tcp or udp)."
+    validate_proto "$new_proto" || die "Invalid --proto (use tcp, udp, or both)."
 
     if is_duplicate_listener "$new_proto" "$new_lip" "$new_lport" "$id"; then
         die "Duplicate listen endpoint already exists for $new_proto $new_lip:$new_lport"
@@ -1085,7 +1139,9 @@ cmd_import() {
 
     local max_id=0 count=0
     declare -A seen_ids=()
-    declare -A seen_listener=()
+    declare -A seen_tcp=()
+    declare -A seen_udp=()
+    declare -A seen_both=()
 
     local line
     while IFS= read -r line || [ -n "$line" ]; do
@@ -1113,12 +1169,30 @@ cmd_import() {
         fi
         seen_ids[$id]=1
 
-        local lkey="${proto}|${lip}|${lport}"
-        if [ -n "${seen_listener[$lkey]:-}" ]; then
-            rm -f "$tmp"
-            die "Duplicate listen endpoint in import: $proto $lip:$lport"
-        fi
-        seen_listener[$lkey]=1
+        local pkey="${lip}:${lport}"
+        case "$proto" in
+            both)
+                if [ -n "${seen_both[$pkey]:-}" ] || [ -n "${seen_tcp[$pkey]:-}" ] || [ -n "${seen_udp[$pkey]:-}" ]; then
+                    rm -f "$tmp"
+                    die "Duplicate listen endpoint in import: both $lip:$lport"
+                fi
+                seen_both[$pkey]=1
+                ;;
+            tcp)
+                if [ -n "${seen_both[$pkey]:-}" ] || [ -n "${seen_tcp[$pkey]:-}" ]; then
+                    rm -f "$tmp"
+                    die "Duplicate listen endpoint in import: tcp $lip:$lport"
+                fi
+                seen_tcp[$pkey]=1
+                ;;
+            udp)
+                if [ -n "${seen_both[$pkey]:-}" ] || [ -n "${seen_udp[$pkey]:-}" ]; then
+                    rm -f "$tmp"
+                    die "Duplicate listen endpoint in import: udp $lip:$lport"
+                fi
+                seen_udp[$pkey]=1
+                ;;
+        esac
 
         [ "$id" -gt "$max_id" ] && max_id="$id"
         count=$((count + 1))
@@ -1191,20 +1265,29 @@ menu_header() {
 menu_quick_add() {
     echo "Add New Forward"
     echo "---------------"
-    local pchoice proto listen dest name enable_ans enabled args=()
-    pchoice="$(prompt_menu_choice "Protocol 1)tcp 2)udp" "1")"
+    local pchoice proto listen_ip ports_input mappings dest_ip name enable_ans enabled
+    local map_count=0
+    pchoice="$(prompt_menu_choice "Protocol 1)both 2)tcp 3)udp" "1")"
     case "$pchoice" in
-        1|tcp|TCP) proto="tcp" ;;
-        2|udp|UDP) proto="udp" ;;
+        1|both|BOTH) proto="both" ;;
+        2|tcp|TCP) proto="tcp" ;;
+        3|udp|UDP) proto="udp" ;;
         *) err "Invalid protocol choice."; return 1 ;;
     esac
 
-    listen="$(prompt_menu_choice "Listen endpoint (IP:PORT)" "0.0.0.0:8080")"
-    parse_endpoint "$listen" >/dev/null 2>&1 || { err "Invalid listen endpoint."; return 1; }
+    listen_ip="$(prompt_menu_choice "Incoming listen IP" "0.0.0.0")"
+    validate_ipv4 "$listen_ip" || { err "Invalid incoming IP."; return 1; }
 
-    dest="$(prompt_menu_choice "Destination endpoint (IP:PORT)")"
-    [ -n "$dest" ] || { err "Destination is required."; return 1; }
-    parse_endpoint "$dest" >/dev/null 2>&1 || { err "Invalid destination endpoint."; return 1; }
+    echo "Ports format:"
+    echo "  8080,2020,3030            => 8080->8080, 2020->2020, 3030->3030"
+    echo "  8080:9090,2020:3030       => 8080->9090, 2020->3030"
+    ports_input="$(prompt_menu_choice "Ports/mappings (comma-separated)")"
+    mappings="$(parse_port_mappings "$ports_input" || true)"
+    [ -n "$mappings" ] || { err "Invalid ports format."; return 1; }
+    map_count="$(printf '%s\n' "$mappings" | sed '/^\s*$/d' | wc -l | tr -d ' ')"
+
+    dest_ip="$(prompt_menu_choice "Destination IP (for all mappings)")"
+    validate_ipv4 "$dest_ip" || { err "Invalid destination IP."; return 1; }
 
     read -r -p "Name (optional): " name
     enable_ans="$(prompt_menu_choice "Enable now? (y/n)" "y")"
@@ -1214,10 +1297,59 @@ menu_quick_add() {
         *) err "Invalid enable choice."; return 1 ;;
     esac
 
-    args=(--proto "$proto" --listen "$listen" --to "$dest")
-    [ -n "${name:-}" ] && args+=(--name "$name")
-    [ "$enabled" = "0" ] && args+=(--disable)
-    run_menu_cmd cmd_add "${args[@]}"
+    name="$(sanitize_name "$name")"
+
+    local pair ext inport
+    while IFS= read -r pair; do
+        [ -n "$pair" ] || continue
+        ext="${pair%%:*}"
+        inport="${pair##*:}"
+        if is_duplicate_listener "$proto" "$listen_ip" "$ext"; then
+            err "Duplicate listener exists for $proto $listen_ip:$ext"
+            return 1
+        fi
+    done <<< "$mappings"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        while IFS= read -r pair; do
+            [ -n "$pair" ] || continue
+            ext="${pair%%:*}"
+            inport="${pair##*:}"
+            local rule_name="$name"
+            if [ -n "$name" ] && [ "${map_count:-0}" -gt 1 ]; then
+                rule_name="${name}-${ext}-to-${inport}"
+            fi
+            local args=(--proto "$proto" --listen "${listen_ip}:${ext}" --to "${dest_ip}:${inport}")
+            [ -n "$rule_name" ] && args+=(--name "$rule_name")
+            [ "$enabled" = "0" ] && args+=(--disable)
+            run_menu_cmd cmd_add "${args[@]}" || return 1
+        done <<< "$mappings"
+        return 0
+    fi
+
+    local current now id row created_count=0
+    current="$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)"
+    [[ "$current" =~ ^[0-9]+$ ]] || current=0
+
+    while IFS= read -r pair; do
+        [ -n "$pair" ] || continue
+        ext="${pair%%:*}"
+        inport="${pair##*:}"
+        current=$((current + 1))
+        id="$current"
+        now="$(now_ts)"
+        local rule_name="$name"
+        if [ -n "$name" ] && [ "${map_count:-0}" -gt 1 ]; then
+            rule_name="${name}-${ext}-to-${inport}"
+        fi
+        row="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$enabled" "$proto" "$listen_ip" "$ext" "$dest_ip" "$inport" "$rule_name" "$now" "$now")"
+        append_rule_line "$row"
+        created_count=$((created_count + 1))
+    done <<< "$mappings"
+
+    set_counter_value "$current"
+    cmd_apply
+    log "Added $created_count rule(s)."
 }
 
 menu_select_rule_id() {
@@ -1239,7 +1371,7 @@ menu_update_rule() {
 
     local proto_input listen_input dest_input name_input state_input
     local args=()
-    read -r -p "Protocol (tcp/udp, Enter=keep): " proto_input
+    read -r -p "Protocol (tcp/udp/both, Enter=keep): " proto_input
     if [ -n "$proto_input" ]; then
         validate_proto "$proto_input" || { err "Invalid protocol."; return 1; }
         args+=(--proto "$proto_input")
@@ -1277,13 +1409,42 @@ menu_update_rule() {
 }
 
 menu_remove_rule() {
-    local id confirm
-    id="$(menu_select_rule_id)" || return 1
-    read -r -p "Remove rule $id? (yes/no) [no]: " confirm
+    local input confirm
+    read -r -p "Rule ID(s) (e.g. 3 or 1,2,5) or 'all': " input
+    input="${input// /}"
+    [ -n "$input" ] || { err "No input."; return 1; }
+
+    local -a ids=()
+    if [ "$input" = "all" ]; then
+        while IFS=$'\t' read -r rid _rest; do
+            [ -n "${rid:-}" ] || continue
+            ids+=("$rid")
+        done < <(tail -n +2 "$RULES_FILE")
+        [ "${#ids[@]}" -gt 0 ] || { log "No rules to remove."; return 0; }
+    else
+        IFS=',' read -r -a ids <<< "$input"
+    fi
+
+    local clean_ids=()
+    local id
+    for id in "${ids[@]}"; do
+        [ -n "$id" ] || continue
+        [[ "$id" =~ ^[0-9]+$ ]] || { err "Invalid rule ID: $id"; return 1; }
+        clean_ids+=("$id")
+    done
+    [ "${#clean_ids[@]}" -gt 0 ] || { err "No valid rule IDs."; return 1; }
+
+    read -r -p "Remove selected rule(s): ${clean_ids[*]} ? (yes/no) [no]: " confirm
     confirm="${confirm:-no}"
     case "$confirm" in
-        yes|YES|y|Y) run_menu_cmd cmd_remove "$id" ;;
-        *) log "Canceled." ;;
+        yes|YES|y|Y)
+            for id in "${clean_ids[@]}"; do
+                run_menu_cmd cmd_remove "$id" || true
+            done
+            ;;
+        *)
+            log "Canceled."
+            ;;
     esac
 }
 

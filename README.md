@@ -13,10 +13,16 @@ cd PortForward
 sudo ./install.sh
 ```
 
-One-line install + run:
+One-line install + run (recommended):
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git && git clone https://github.com/KiaTheRandomGuy/PortForward.git && cd PortForward && sudo ./install.sh && sudo pfwd
+curl -fsSL https://raw.githubusercontent.com/KiaTheRandomGuy/PortForward/main/bootstrap.sh | sudo bash
+```
+
+One-line install/update only (do not auto-open menu):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KiaTheRandomGuy/PortForward/main/bootstrap.sh | sudo RUN_PFWD=0 bash
 ```
 
 What install does:
@@ -33,10 +39,13 @@ sudo pfwd
 
 Then:
 1. Select `1) Quick Add Forward`
-2. Enter protocol (`tcp` or `udp`)
-3. Enter listen endpoint (`IP:PORT`) for this server
-4. Enter destination endpoint (`IP:PORT`) where traffic must go
-5. Use `2) List Forwards` to confirm
+2. Protocol default is `both` (TCP+UDP)
+3. Enter incoming listen IP (default `0.0.0.0`)
+4. Enter ports/mappings (comma-separated), examples:
+   - `8080,2020,3030` means `8080->8080`, `2020->2020`, `3030->3030`
+   - `8080:9090,2020:3030` means `8080->9090`, `2020->3030`
+5. Enter one destination IP (used for all mappings)
+6. Use `2) List Forwards` to confirm
 
 ## Forward One Port (CLI example)
 Example: forward server port `443` to destination `10.10.10.20:8443`:
@@ -82,10 +91,10 @@ Commands:
 - `init`
 - `perf show`
 - `perf set [--match-pub-iface 0|1] [--snat-mode auto|snat|masquerade] [--snat-ip IP]`
-- `add --proto tcp|udp --listen IP:PORT --to IP:PORT [--name NAME] [--enable|--disable]`
+- `add [--proto tcp|udp|both] --listen IP:PORT --to IP:PORT [--name NAME] [--enable|--disable]`
 - `list`
 - `show <id>`
-- `update <id> [--proto tcp|udp] [--listen IP:PORT] [--to IP:PORT] [--name NAME] [--enable|--disable]`
+- `update <id> [--proto tcp|udp|both] [--listen IP:PORT] [--to IP:PORT] [--name NAME] [--enable|--disable]`
 - `remove <id>`
 - `enable <id>`
 - `disable <id>`
