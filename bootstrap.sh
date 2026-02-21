@@ -52,6 +52,11 @@ main() {
     "$INSTALL_DIR/install.sh"
 
     if [ "$RUN_PFWD" = "1" ]; then
+        # When launched via "curl | bash", stdin is a pipe.
+        # Reattach pfwd to the real terminal so the interactive menu opens.
+        if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+            exec pfwd </dev/tty >/dev/tty 2>/dev/tty
+        fi
         exec pfwd
     fi
 }
