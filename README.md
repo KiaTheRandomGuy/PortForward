@@ -19,12 +19,6 @@ One-line install + run (recommended):
 curl -fsSL https://raw.githubusercontent.com/KiaTheRandomGuy/PortForward/main/bootstrap.sh | sudo bash
 ```
 
-One-line install/update only (do not auto-open menu):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/KiaTheRandomGuy/PortForward/main/bootstrap.sh | sudo RUN_PFWD=0 bash
-```
-
 What install does:
 - installs `pfwd` to `/usr/local/bin/pfwd`
 - installs boot restore service `pfwd-restore.service`
