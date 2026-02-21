@@ -1,0 +1,12 @@
+[Unit]
+Description=PFWD Port Forward Restore
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pfwd apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
