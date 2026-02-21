@@ -13,6 +13,12 @@ cd PortForward
 sudo ./install.sh
 ```
 
+One-line install + run:
+
+```bash
+sudo apt-get update && sudo apt-get install -y git && git clone https://github.com/KiaTheRandomGuy/PortForward.git && cd PortForward && sudo ./install.sh && sudo pfwd
+```
+
 What install does:
 - installs `pfwd` to `/usr/local/bin/pfwd`
 - installs boot restore service `pfwd-restore.service`
