@@ -19,6 +19,10 @@ One-line install + run (recommended):
 curl -fsSL https://raw.githubusercontent.com/KiaTheRandomGuy/PortForward/main/bootstrap.sh | sudo bash
 ```
 
+This command is idempotent:
+- new server: clone + install + run
+- existing server: force-sync to latest GitHub version + reinstall + run
+
 What install does:
 - installs `pfwd` to `/usr/local/bin/pfwd`
 - installs boot restore service `pfwd-restore.service`

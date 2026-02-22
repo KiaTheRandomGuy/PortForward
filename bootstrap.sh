@@ -32,6 +32,36 @@ install_git_if_missing() {
     exit 1
 }
 
+refresh_repo() {
+    local target="${1:?}"
+    local url="${2:?}"
+    local remote_head branch
+
+    if [ -d "$target/.git" ]; then
+        if git -C "$target" fetch --all --prune; then
+            remote_head="$(git -C "$target" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+            if [ -z "$remote_head" ]; then
+                if git -C "$target" show-ref --verify --quiet refs/remotes/origin/main; then
+                    remote_head="origin/main"
+                elif git -C "$target" show-ref --verify --quiet refs/remotes/origin/master; then
+                    remote_head="origin/master"
+                fi
+            fi
+
+            if [ -n "$remote_head" ]; then
+                branch="${remote_head#origin/}"
+                git -C "$target" checkout -f "$branch" >/dev/null 2>&1 || true
+                if git -C "$target" reset --hard "$remote_head"; then
+                    return 0
+                fi
+            fi
+        fi
+    fi
+
+    rm -rf "$target"
+    git clone "$url" "$target"
+}
+
 main() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
         echo "Please run as root (example: curl ... | sudo bash)" >&2
@@ -40,13 +70,7 @@ main() {
 
     install_git_if_missing
 
-    if [ -d "$INSTALL_DIR/.git" ]; then
-        git -C "$INSTALL_DIR" fetch --all --prune
-        git -C "$INSTALL_DIR" pull --ff-only
-    else
-        rm -rf "$INSTALL_DIR"
-        git clone "$REPO_URL" "$INSTALL_DIR"
-    fi
+    refresh_repo "$INSTALL_DIR" "$REPO_URL"
 
     chmod +x "$INSTALL_DIR/install.sh"
     "$INSTALL_DIR/install.sh"

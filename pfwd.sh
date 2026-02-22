@@ -207,6 +207,29 @@ detect_src_ip_for_dst() {
     printf '%s' "$src"
 }
 
+detect_server_ipv4() {
+    local ip=""
+    ip="$(detect_src_ip_for_dst "1.1.1.1" || true)"
+    if validate_ipv4 "$ip"; then
+        printf '%s' "$ip"
+        return 0
+    fi
+
+    ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+    if validate_ipv4 "$ip"; then
+        printf '%s' "$ip"
+        return 0
+    fi
+
+    ip="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/){print $i; exit}}' || true)"
+    if validate_ipv4 "$ip"; then
+        printf '%s' "$ip"
+        return 0
+    fi
+
+    printf 'N/A'
+}
+
 ensure_perf_config_file() {
     mkdir -p "$PFWD_DIR"
     if [ -f "$PERF_CONFIG_FILE" ]; then
@@ -1003,7 +1026,9 @@ cmd_status() {
     load_perf_profile
 
     local ipfwd="unknown"
+    local server_ipv4="N/A"
     [ -r /proc/sys/net/ipv4/ip_forward ] && ipfwd="$(cat /proc/sys/net/ipv4/ip_forward)"
+    server_ipv4="$(detect_server_ipv4 || echo N/A)"
 
     local chains_ok="unknown"
     local hooks_ok="unknown"
@@ -1039,6 +1064,7 @@ cmd_status() {
 
     if [ "$OUTPUT_JSON" -eq 1 ]; then
         printf '{'
+        printf '"server_ipv4":"%s",' "$(json_escape "$server_ipv4")"
         printf '"ip_forward":"%s",' "$(json_escape "$ipfwd")"
         printf '"chains_ok":"%s",' "$(json_escape "$chains_ok")"
         printf '"hooks_ok":"%s",' "$(json_escape "$hooks_ok")"
@@ -1056,6 +1082,7 @@ cmd_status() {
 
     log "pfwd version:        $VERSION"
     log "state dir:           $PFWD_DIR"
+    log "server ipv4:         $server_ipv4"
     log "ip_forward:          $ipfwd"
     log "chains ready:        $chains_ok"
     log "hooks ready:         $hooks_ok"
@@ -1242,9 +1269,11 @@ prompt_menu_choice() {
 }
 
 menu_header() {
+    local server_ipv4="N/A"
     if [ -t 1 ]; then
         clear
     fi
+    server_ipv4="$(detect_server_ipv4 || echo N/A)"
     echo "========================================"
     echo " PFWD Interactive Manager v$VERSION"
     echo "========================================"
@@ -1259,6 +1288,7 @@ menu_header() {
     else
         echo "Rules: 0"
     fi
+    echo "Server IPv4: $server_ipv4"
     echo ""
 }
 
