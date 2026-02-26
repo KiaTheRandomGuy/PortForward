@@ -70,6 +70,7 @@ sudo pfwd remove 1
 - Forwarding happens in kernel via `iptables` rules.
 - Default profile is optimized for low overhead:
   - public-interface matching enabled
+  - destination-route interface matching enabled
   - automatic fixed SNAT when safe
 
 Show or change performance profile:
@@ -77,6 +78,21 @@ Show or change performance profile:
 ```bash
 sudo pfwd perf show
 sudo pfwd perf set --match-pub-iface 1 --snat-mode auto --snat-ip ""
+```
+
+## Tunnel/V2Ray Troubleshooting
+If destination traffic goes through a tunnel interface (`gre`, `wg`, `tun`, etc.):
+
+```bash
+sudo pfwd apply
+sudo pfwd status
+sudo pfwd show <rule-id>
+```
+
+If you still have issues, switch to maximum compatibility profile:
+
+```bash
+sudo pfwd perf set --match-pub-iface 0 --snat-mode masquerade --snat-ip ""
 ```
 
 ## Full Command Reference

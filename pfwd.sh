@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 PFWD_DIR="${PFWD_DIR:-/etc/pfwd}"
 RULES_FILE="$PFWD_DIR/rules.tsv"
@@ -207,6 +207,18 @@ detect_src_ip_for_dst() {
     printf '%s' "$src"
 }
 
+detect_out_iface_for_dst() {
+    local dst="${1:-}"
+    local dev=""
+    [ -n "$dst" ] || return 1
+    dev="$(ip -4 route get "$dst" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+    if [ -n "$dev" ] && ip link show "$dev" >/dev/null 2>&1; then
+        printf '%s' "$dev"
+        return 0
+    fi
+    return 1
+}
+
 detect_server_ipv4() {
     local ip=""
     ip="$(detect_src_ip_for_dst "1.1.1.1" || true)"
@@ -237,7 +249,7 @@ ensure_perf_config_file() {
     fi
     cat > "$PERF_CONFIG_FILE" <<'EOF'
 # PFWD performance profile
-# 1 = match only public interface for forwarded traffic (faster/stricter)
+# 1 = match inbound public interface and destination route interface (faster/stricter)
 PFWD_MATCH_PUB_IFACE="1"
 # auto = prefer SNAT with detected source IP, fallback to MASQUERADE
 # snat = force SNAT when a source IP is available (or from PFWD_SNAT_IP), fallback to MASQUERADE
@@ -428,12 +440,19 @@ ensure_chains() {
     iptables -t nat -N "$CHAIN_NAT_POST" 2>/dev/null || true
     iptables -t filter -N "$CHAIN_FILTER_FWD" 2>/dev/null || true
 
-    iptables -t nat -C PREROUTING -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_PRE" >/dev/null 2>&1 || \
-        iptables -t nat -A PREROUTING -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_PRE"
-    iptables -t nat -C POSTROUTING -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_POST" >/dev/null 2>&1 || \
-        iptables -t nat -A POSTROUTING -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_POST"
-    iptables -t filter -C FORWARD -m comment --comment "pfwd-jump" -j "$CHAIN_FILTER_FWD" >/dev/null 2>&1 || \
-        iptables -t filter -A FORWARD -m comment --comment "pfwd-jump" -j "$CHAIN_FILTER_FWD"
+    while iptables -t nat -C PREROUTING -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_PRE" >/dev/null 2>&1; do
+        iptables -t nat -D PREROUTING -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_PRE" >/dev/null 2>&1 || true
+    done
+    while iptables -t nat -C POSTROUTING -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_POST" >/dev/null 2>&1; do
+        iptables -t nat -D POSTROUTING -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_POST" >/dev/null 2>&1 || true
+    done
+    while iptables -t filter -C FORWARD -m comment --comment "pfwd-jump" -j "$CHAIN_FILTER_FWD" >/dev/null 2>&1; do
+        iptables -t filter -D FORWARD -m comment --comment "pfwd-jump" -j "$CHAIN_FILTER_FWD" >/dev/null 2>&1 || true
+    done
+
+    iptables -t nat -I PREROUTING 1 -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_PRE"
+    iptables -t nat -I POSTROUTING 1 -m comment --comment "pfwd-jump" -j "$CHAIN_NAT_POST"
+    iptables -t filter -I FORWARD 1 -m comment --comment "pfwd-jump" -j "$CHAIN_FILTER_FWD"
 }
 
 delete_matching_rules_table() {
@@ -473,29 +492,37 @@ apply_rule_proto() {
 
     local comment_base="pfwd:${id}"
     local dmatch=()
-    local in_if=()
-    local out_if=()
+    local in_if_pub=()
+    local out_if_dest=()
+    local in_if_dest=()
+    local dest_if=""
     if [ "$listen_ip" != "0.0.0.0" ]; then
         dmatch=(-d "$listen_ip")
     fi
     if [ "${PFWD_MATCH_PUB_IFACE:-1}" = "1" ] && [ -n "$pub_if" ] && [ "$listen_ip" = "0.0.0.0" ]; then
-        in_if=(-i "$pub_if")
-        out_if=(-o "$pub_if")
+        in_if_pub=(-i "$pub_if")
+    fi
+    if [ "${PFWD_MATCH_PUB_IFACE:-1}" = "1" ]; then
+        dest_if="$(detect_out_iface_for_dst "$dest_ip" || true)"
+        if [ -n "$dest_if" ]; then
+            out_if_dest=(-o "$dest_if")
+            in_if_dest=(-i "$dest_if")
+        fi
     fi
 
     ipt_append_unique nat "$CHAIN_NAT_PRE" \
-        "${in_if[@]}" "${dmatch[@]}" -p "$proto" --dport "$listen_port" \
+        "${in_if_pub[@]}" "${dmatch[@]}" -p "$proto" --dport "$listen_port" \
         -m comment --comment "${comment_base}:dnat:${listen_ip}:${listen_port}->${dest_ip}:${dest_port}" \
         -j DNAT --to-destination "${dest_ip}:${dest_port}"
 
     ipt_append_unique filter "$CHAIN_FILTER_FWD" \
-        "${in_if[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
+        "${in_if_pub[@]}" "${out_if_dest[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
         -m conntrack --ctstate NEW,ESTABLISHED,RELATED \
         -m comment --comment "${comment_base}:fwd:${listen_port}->${dest_port}" \
         -j ACCEPT
 
     ipt_append_unique filter "$CHAIN_FILTER_FWD" \
-        "${out_if[@]}" -p "$proto" -s "$dest_ip" --sport "$dest_port" \
+        "${in_if_dest[@]}" -p "$proto" -s "$dest_ip" --sport "$dest_port" \
         -m conntrack --ctstate ESTABLISHED,RELATED \
         -m comment --comment "${comment_base}:rev:${listen_port}->${dest_port}" \
         -j ACCEPT
@@ -512,12 +539,12 @@ apply_rule_proto() {
 
     if [ -n "$snat_ip" ]; then
         ipt_append_unique nat "$CHAIN_NAT_POST" \
-            "${out_if[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
+            "${out_if_dest[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
             -m comment --comment "${comment_base}:snat-fixed:${listen_port}->${dest_port}:${snat_ip}" \
             -j SNAT --to-source "$snat_ip"
     else
         ipt_append_unique nat "$CHAIN_NAT_POST" \
-            "${out_if[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
+            "${out_if_dest[@]}" -p "$proto" -d "$dest_ip" --dport "$dest_port" \
             -m comment --comment "${comment_base}:snat-masq:${listen_port}->${dest_port}" \
             -j MASQUERADE
     fi
